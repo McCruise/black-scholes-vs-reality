@@ -1,0 +1,14 @@
+Hi all,
+
+Following the review of the completed model identification templates, Clara and I identified a few points where the criteria have been applied inconsistently. We propose the following clarifications:
+
+* Criterion II: clarify that simple arithmetic and mechanical aggregation do not constitute modelling techniques.
+* Criterion III: clarify that deterministic processing does not imply absence of inherent uncertainty, as uncertainty may arise from the inputs, processing or outputs.
+* Criterion V: remove it from the classification checklist and assess Model RTF scope separately. Alternatively, if retained, clarify that scope should be assessed based on the business use/risk type, irrespective of the tool’s current classification.
+
+These clarify the application of the existing Model Risk Standard and do not change the underlying framework.
+
+Unless anyone disagrees with this approach, I will apply it to the individual assessments and contact the relevant tool owners where updates are required.
+
+Best,
+Ayoub
