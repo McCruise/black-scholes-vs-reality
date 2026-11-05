@@ -1,21 +1,3 @@
-use_actual_dates = getattr(self, "mt4_actual_dates", False)
-
-if use_actual_dates:
-    report = self._params["reporting_date"]
-    reporting_date = pl.date(report["year"], report["month"], report["day"])
-    payment_date = pl.col(self._input_bucket_col["cashflow_data"])
-    time_factor = (payment_date - reporting_date).dt.total_days() / 365
-
-    invalid_dates = self.cashflow_data.filter(
-        ~time_factor.is_finite().fill_null(False) | (time_factor < 0)
-    )
-    if invalid_dates.height:
-        raise ValueError(
-            f"Actual-date test: {invalid_dates.height} rows have invalid maturities."
-        )
-
-
-
 actual_calculator = CsrbbEngine(
     path_to_config="./core_config_regular.yaml",
     stress_mode=stress_testing_mode,
@@ -46,7 +28,3 @@ display(
         | (pl.col("actual_rank") <= 5)
     ).sort("actual_rank")
 )
-
-
-
-
