@@ -1,11 +1,52 @@
-display(
-    drivers.group_by("shock_date")
-    .agg(
-        pl.col("increase").sum().alias("bucket_total"),
-        pl.col("increase").null_count().alias("missing_groups"),
+use_actual_dates = getattr(self, "mt4_actual_dates", False)
+
+if use_actual_dates:
+    report = self._params["reporting_date"]
+    reporting_date = pl.date(report["year"], report["month"], report["day"])
+    payment_date = pl.col(self._input_bucket_col["cashflow_data"])
+    time_factor = (payment_date - reporting_date).dt.total_days() / 365
+
+    invalid_dates = self.cashflow_data.filter(
+        ~time_factor.is_finite().fill_null(False) | (time_factor < 0)
     )
-    .join(tail.select("shock_date", "split_minus_midpoint"), on="shock_date")
-    .with_columns(
-        (pl.col("bucket_total") - pl.col("split_minus_midpoint")).alias("difference")
-    )
+    if invalid_dates.height:
+        raise ValueError(
+            f"Actual-date test: {invalid_dates.height} rows have invalid maturities."
+        )
+
+
+
+actual_calculator = CsrbbEngine(
+    path_to_config="./core_config_regular.yaml",
+    stress_mode=stress_testing_mode,
+    path_to_sensitivity_config=path_sensi_config,
 )
+actual_calculator.mt4_actual_dates = True
+actual_calculator.run_all()
+
+actual = ranked_losses(actual_calculator, "actual")
+comparison = paired.join(actual, on="shock_date", validate="1:1")
+
+if comparison.height != paired.height or comparison.height != actual.height:
+    raise ValueError("The actual-date run has a different set of shock dates.")
+
+midpoint_hvar = midpoint_calculator._results
+actual_hvar = actual_calculator._results
+
+print(f"Midpoint HVaR:           €{midpoint_hvar:,.2f}")
+print(f"Split HVaR:              €{csrbb_calculator._results:,.2f}")
+print(f"Actual payment date HVaR: €{actual_hvar:,.2f}")
+print(f"Actual minus midpoint:   €{actual_hvar - midpoint_hvar:,.2f}")
+print(f"Change versus midpoint:   {actual_hvar / midpoint_hvar - 1:+.2%}")
+
+display(
+    comparison.filter(
+        (pl.col("midpoint_rank") <= 5)
+        | (pl.col("split_rank") <= 5)
+        | (pl.col("actual_rank") <= 5)
+    ).sort("actual_rank")
+)
+
+
+
+
