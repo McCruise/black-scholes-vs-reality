@@ -1,30 +1,98 @@
-actual_calculator = CsrbbEngine(
-    path_to_config="./core_config_regular.yaml",
-    stress_mode=stress_testing_mode,
-    path_to_sensitivity_config=path_sensi_config,
+from datetime import date
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# bucket_losses() uses this list to select the historical shocks.
+dates = [date(2019, 12, 2), date(2019, 12, 5)]
+focus = comparison.filter(pl.col("shock_date").is_in(dates)).sort("shock_date")
+
+keys = ["shock_date", "bucket", "side"]
+by_bucket = (
+    bucket_losses(midpoint_calculator, "midpoint")
+    .join(bucket_losses(csrbb_calculator, "split"),
+          on=keys, how="full", coalesce=True, validate="1:1")
+    .join(bucket_losses(actual_calculator, "actual"),
+          on=keys, how="full", coalesce=True, validate="1:1")
 )
-actual_calculator.mt4_actual_dates = True
-actual_calculator.run_all()
 
-actual = ranked_losses(actual_calculator, "actual")
-comparison = paired.join(actual, on="shock_date", validate="1:1")
+if any(by_bucket[c].null_count() for c in ["midpoint", "split", "actual"]):
+    raise ValueError("Some maturity groups are missing in one of the runs.")
 
-if comparison.height != paired.height or comparison.height != actual.height:
-    raise ValueError("The actual-date run has a different set of shock dates.")
+liability = pl.col("side") == "liability"
+groups = ["4–5y liabilities", "5–6y liabilities", "Rest of portfolio"]
 
-midpoint_hvar = midpoint_calculator._results
-actual_hvar = actual_calculator._results
-
-print(f"Midpoint HVaR:           €{midpoint_hvar:,.2f}")
-print(f"Split HVaR:              €{csrbb_calculator._results:,.2f}")
-print(f"Actual payment date HVaR: €{actual_hvar:,.2f}")
-print(f"Actual minus midpoint:   €{actual_hvar - midpoint_hvar:,.2f}")
-print(f"Change versus midpoint:   {actual_hvar / midpoint_hvar - 1:+.2%}")
-
-display(
-    comparison.filter(
-        (pl.col("midpoint_rank") <= 5)
-        | (pl.col("split_rank") <= 5)
-        | (pl.col("actual_rank") <= 5)
-    ).sort("actual_rank")
+changes = (
+    by_bucket.with_columns(
+        pl.when(liability & (pl.col("bucket") == "bucket_10"))
+        .then(pl.lit(groups[0]))
+        .when(liability & (pl.col("bucket") == "bucket_11"))
+        .then(pl.lit(groups[1]))
+        .otherwise(pl.lit(groups[2]))
+        .alias("group"),
+        (pl.col("split") - pl.col("midpoint")).alias("split_change"),
+        (pl.col("actual") - pl.col("midpoint")).alias("actual_change"),
+    )
+    .group_by("shock_date", "group")
+    .agg(pl.col("split_change", "actual_change").sum())
 )
+
+totals = (
+    changes.group_by("shock_date")
+    .agg(pl.col("split_change", "actual_change").sum())
+    .sort("shock_date")
+)
+expected = focus.select(
+    pl.col("split_loss") - pl.col("midpoint_loss"),
+    pl.col("actual_loss") - pl.col("midpoint_loss"),
+)
+if (
+    focus["shock_date"].to_list() != dates
+    or totals["shock_date"].to_list() != dates
+    or not np.allclose(
+        totals.select("split_change", "actual_change").to_numpy(),
+        expected.to_numpy(), rtol=0, atol=0.01,
+    )
+):
+    raise ValueError("The maturity group changes do not reconcile to portfolio losses.")
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5), constrained_layout=True)
+
+capital = np.array([
+    midpoint_calculator._results,
+    23_406_040.93,  # Original combined weighted average from the TDD
+    csrbb_calculator._results,
+    actual_calculator._results,
+]) / 1e6
+
+bars = ax1.bar(
+    ["Midpoint", "Combined\n(TDD)", "Split", "Actual dates"],
+    capital,
+    color=["#64748b", "#94a3b8", "#2563eb", "#0f766e"],
+)
+ax1.bar_label(bars, fmt="%.2f", padding=3)
+ax1.set_ylim(0, max(capital) * 1.15)
+ax1.set_title("Total CSRBB capital")
+ax1.set_ylabel("99.9% HVaR (€m)")
+
+rows = {(r["shock_date"], r["group"]): r for r in changes.to_dicts()}
+plot_keys = [(d, group) for d in dates for group in groups]
+x = np.arange(len(plot_keys))
+
+for column, offset, label, color in [
+    ("split_change", -0.18, "Split", "#2563eb"),
+    ("actual_change", 0.18, "Actual dates", "#0f766e"),
+]:
+    values = [rows[key][column] / 1e6 for key in plot_keys]
+    bars = ax2.bar(x + offset, values, width=0.36, label=label, color=color)
+    ax2.bar_label(bars, fmt="%+.2f", padding=2, fontsize=8)
+
+ax2.set_xticks(x, [f"{d:%d %b}\n{group}" for d, group in plot_keys], fontsize=8)
+ax2.axhline(0, color="#64748b", linewidth=0.8)
+ax2.margins(y=0.2)
+ax2.set_title("What increased losses on the two HVaR shocks")
+ax2.set_ylabel("Change versus midpoint (€m)")
+ax2.legend()
+
+plt.show()
+display(changes.sort(["shock_date", "group"]))
