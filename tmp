@@ -1,33 +1,11 @@
-dates = tail.filter(pl.col("split_rank").is_in([2, 3]))["shock_date"].to_list()
-
-def bucket_losses(calc, loss_name):
-    date_col = calc._date_col["spread_changes"]
-    bucket_col = calc._mapped_bucket_col["present_values"]
-    side_col = calc._banking_book_type_col["present_values"]
-    base_pv = calc._value_col["present_values"]
-    shocked_pv = calc._value_col["shocked_present_value"]
-
-    return (
-        calc._spread_risk_details
-        .filter(pl.col(date_col).is_in(dates))
-        .group_by(date_col, bucket_col, side_col)
-        .agg((pl.col(base_pv).sum() - pl.col(shocked_pv).sum()).alias(loss_name))
-        .rename({date_col: "shock_date", bucket_col: "bucket", side_col: "side"})
+display(
+    drivers.group_by("shock_date")
+    .agg(
+        pl.col("increase").sum().alias("bucket_total"),
+        pl.col("increase").null_count().alias("missing_groups"),
     )
-
-drivers = (
-    bucket_losses(midpoint_calculator, "midpoint_loss")
-    .join(
-        bucket_losses(csrbb_calculator, "split_loss"),
-        on=["shock_date", "bucket", "side"],
-        how="full",
-        coalesce=True,
-        validate="1:1",
-    )
+    .join(tail.select("shock_date", "split_minus_midpoint"), on="shock_date")
     .with_columns(
-        (pl.col("split_loss") - pl.col("midpoint_loss")).alias("increase")
+        (pl.col("bucket_total") - pl.col("split_minus_midpoint")).alias("difference")
     )
-    .sort(["shock_date", pl.col("increase").abs()], descending=[False, True])
 )
-
-display(drivers.group_by("shock_date").head(5))
