@@ -1,0 +1,34 @@
+bucket_col = self._mapped_bucket_col["present_values"]
+side_col = self._banking_book_type_col["cashflow_data"]
+factor_col = str(self._value_col["time_factors"])
+
+bucket = pl.col(bucket_col)
+side = pl.col(side_col)
+factors = self.time_factors_by_side
+
+if factors is None:
+    time_factor = bucket.replace(self.time_factors).cast(pl.Float64)
+else:
+    time_factor = (
+        pl.when(side == "asset")
+        .then(bucket.replace_strict(
+            factors["asset"], default=None, return_dtype=pl.Float64
+        ))
+        .when(side == "liability")
+        .then(bucket.replace_strict(
+            factors["liability"], default=None, return_dtype=pl.Float64
+        ))
+        .otherwise(None)
+    )
+
+
+
+if factors is not None:
+    invalid = (
+        present_value_helper
+        .filter(~pl.col(factor_col).is_finite().fill_null(False))
+        .select(side_col, bucket_col)
+        .unique()
+    )
+    if invalid.height:
+        raise ValueError(f"Missing or invalid MT4 time factors:\n{invalid}")
