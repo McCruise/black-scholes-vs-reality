@@ -1,0 +1,15 @@
+Title: Midpoint discounting understates CSRBB on the tested portfolio (Bundesbank finding 457(d))
+
+Description: The latest MT4 test shows that using one weighted average maturity per bucket increases CSRBB HVaR by €0.96m (4.28%) relative to midpoint discounting. Validation extended the test by using separate weighted average maturities for assets and liabilities, which increased HVaR by €1.37m (6.12%). Using individual projected payment dates across the full historical shock set increased HVaR by €1.52m (6.77%), with the existing curve mappings held fixed. The same two historical shocks drove the 99.9th percentile. The higher HVaR came from larger losses under those shocks.
+
+On those two shock dates, approximately 96% of the difference between the split weighted average and midpoint runs came from the 4–5 and 5–6 year liability buckets, which are dominated by AT1. This points to the discounting of large AT1 redemptions as the main driver. Their projected payment dates depend on assumed call dates. Moving the two AT1 redemption rows one year later increased HVaR by €4.60m under payment-date discounting in an illustrative sensitivity. The €1.52m gap measures the impact of midpoint discounting on the original schedule. The €4.60m sensitivity shows the separate exposure to the assumed call dates.
+
+Risk Category: Model Performance
+
+Issue Severity: To be agreed based on the impact on the applicable ICAAP measure.
+
+Issue Owner: CSRBB Model Owner (proposed).
+
+Action Plan: If midpoint discounting is retained for the upcoming run, Development should quantify the positive gap against the payment-date benchmark on the reporting portfolio and propose a temporary model risk buffer on the applicable ICAAP measure. Document the rationale for retaining midpoints, the buffer calculation and its review criteria in the TDD response to finding 457(d). Validation should verify the implemented treatment before supporting closure.
+
+Target Date: To be agreed before submission to Internal Audit.
