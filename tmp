@@ -1,0 +1,338 @@
+# Paste this section after the cell that creates cashflows_dict_liabs.
+# Run the notebook from the top first. csrbb_calculator must be the normal run.
+
+from copy import deepcopy
+from datetime import date, datetime
+from math import isclose, isfinite
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
+
+
+# 1. Reuse the normal run. Execute only the three additional challengers.
+midpoint_calculator = csrbb_calculator
+if midpoint_calculator._results is None or not isfinite(midpoint_calculator._results):
+    raise RuntimeError("Complete the initial normal run before this section.")
+if (
+    midpoint_calculator.time_factors_by_side is not None
+    or midpoint_calculator.mt4_actual_dates
+    or midpoint_calculator._stress_scenario is not None
+):
+    raise RuntimeError("Restart and run from the top. The first run must be normal.")
+
+
+def run_challenger(config, side_factors=None, actual_dates=False):
+    """Run one challenger with an independent copy of the normal configuration."""
+    calculator = CsrbbEngine(
+        path_to_config=midpoint_calculator._config_path,
+        config=deepcopy(config),
+        stress_mode=None,
+        path_to_sensitivity_config=path_sensi_config,
+    )
+    calculator.time_factors_by_side = side_factors
+    calculator.mt4_actual_dates = actual_dates
+    calculator.run_all()
+    if calculator._results is None or not isfinite(calculator._results):
+        raise RuntimeError("A challenger failed. Check its engine log.")
+    return calculator
+
+
+# Reject undefined weighted maturities, including zero-weight averages.
+for factors in (cashflows_all_dict, cashflows_dict_assets, cashflows_dict_liabs):
+    if any(value is None or not isfinite(value) for value in factors.values()):
+        raise ValueError("A weighted maturity is missing or non-finite.")
+
+# Update the current factors. Retain configuration entries for unused buckets.
+combined_config = deepcopy(midpoint_calculator.config)
+combined_config["mappings"]["time_factors"].update(cashflows_all_dict)
+combined_calculator = run_challenger(combined_config)
+
+split_calculator = run_challenger(
+    midpoint_calculator.config,
+    side_factors={
+        "asset": cashflows_dict_assets,
+        "liability": cashflows_dict_liabs,
+    },
+)
+actual_calculator = run_challenger(
+    midpoint_calculator.config, actual_dates=True
+)
+
+calculators = {
+    "midpoint": midpoint_calculator,
+    "combined": combined_calculator,
+    "split": split_calculator,
+    "actual": actual_calculator,
+}
+labels = {
+    "midpoint": "Midpoints",
+    "combined": "Combined average",
+    "split": "Separate averages",
+    "actual": "Actual payment dates",
+}
+colors = ["#687787", "#258F88", "#DC9631", "#355C92"]
+focus_dates = [date(2019, 12, 2), date(2019, 12, 5)]
+
+
+# 2. Match historical scenarios. Rank losses separately for each treatment.
+def ranked_losses(calculator, method):
+    """Break equal-loss ties by shock date for a reproducible ranking."""
+    loss_col = f"{method}_loss"
+    return (
+        calculator._daily_spreads
+        .select(
+            pl.col(calculator._date_col["spread_changes"]).alias("shock_date"),
+            pl.col(calculator._value_col["csrbb_daily_risk"]).alias(loss_col),
+        )
+        .sort([loss_col, "shock_date"], descending=[True, False])
+        .with_row_index(f"{method}_rank", offset=1)
+    )
+
+
+loss_tables = {
+    method: ranked_losses(calculator, method)
+    for method, calculator in calculators.items()
+}
+comparison = loss_tables["midpoint"]
+for method in ("combined", "split", "actual"):
+    comparison = comparison.join(
+        loss_tables[method], on="shock_date", how="inner", validate="1:1"
+    )
+if comparison.is_empty() or any(
+    comparison.height != table.height for table in loss_tables.values()
+):
+    raise ValueError("The four runs have different or empty shock-date sets.")
+
+focus = comparison.filter(pl.col("shock_date").is_in(focus_dates)).sort("shock_date")
+if focus.height != len(focus_dates):
+    raise ValueError("A selected chart date is absent. Check focus_dates above.")
+
+
+# 3. Explain selected scenario losses by maturity bucket and balance-sheet side.
+def bucket_losses(calculator, method, shock_dates):
+    """Sum signed base PV minus shocked PV before comparing methods."""
+    date_col = calculator._date_col["spread_changes"]
+    bucket_col = calculator._mapped_bucket_col["present_values"]
+    side_col = calculator._banking_book_type_col["present_values"]
+    base_pv = calculator._value_col["present_values"]
+    shocked_pv = calculator._value_col["shocked_present_value"]
+    return (
+        calculator._spread_risk_details
+        .filter(pl.col(date_col).is_in(shock_dates))
+        .group_by([date_col, bucket_col, side_col])
+        .agg(
+            (pl.col(base_pv).sum() - pl.col(shocked_pv).sum())
+            .alias(f"{method}_loss")
+        )
+        .rename({date_col: "shock_date", bucket_col: "bucket", side_col: "side"})
+    )
+
+
+keys = ["shock_date", "bucket", "side"]
+by_bucket = bucket_losses(midpoint_calculator, "midpoint", focus_dates)
+for method in ("combined", "split", "actual"):
+    by_bucket = by_bucket.join(
+        bucket_losses(calculators[method], method, focus_dates),
+        on=keys, how="full", coalesce=True, validate="1:1",
+    )
+if any(by_bucket[f"{method}_loss"].null_count() for method in calculators):
+    raise ValueError("A bucket or side is missing from one of the four runs.")
+
+# Allow one cent for floating-point summation differences. Check every method.
+reconciliation_rows = []
+for row in focus.to_dicts():
+    scenario = by_bucket.filter(pl.col("shock_date") == row["shock_date"])
+    for method in calculators:
+        bucket_total = scenario[f"{method}_loss"].sum()
+        difference = bucket_total - row[f"{method}_loss"]
+        if not isclose(difference, 0, rel_tol=0, abs_tol=0.01):
+            raise ValueError(f"Bucket reconciliation failed for {method}.")
+        reconciliation_rows.append({
+            "shock_date": row["shock_date"], "method": method,
+            "bucket_total_eur": bucket_total, "difference_eur": difference,
+        })
+
+
+# 4. Prepare the report. Later tables and figures reuse stored results only.
+report_dir = Path("mt4_comparison") / datetime.now().strftime("%Y%m%d_%H%M%S")
+report_dir.mkdir(parents=True, exist_ok=True)
+plt.rcParams.update({
+    "font.size": 10, "axes.spines.top": False,
+    "axes.spines.right": False, "figure.facecolor": "white",
+})
+
+
+def finish_figure(figure, filename):
+    figure.savefig(report_dir / filename, dpi=220, bbox_inches="tight")
+    plt.show()
+    plt.close(figure)
+
+
+def show_table(frame, title, filename, formats):
+    """Create a formatted table image and display it in the notebook."""
+    rows = []
+    for row in frame.iter_rows(named=True):
+        cells = []
+        for column in frame.columns:
+            value = row[column]
+            if value is None:
+                cells.append("n/a")
+            elif column in formats:
+                cells.append(format(value, formats[column]))
+            else:
+                cells.append(str(value))
+        rows.append(cells)
+    figure, axis = plt.subplots(figsize=(12, 1.3 + 0.4 * len(rows)))
+    axis.axis("off")
+    axis.set_title(title, loc="left", fontweight="bold", pad=14)
+    table = axis.table(cellText=rows, colLabels=frame.columns, loc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5)
+    table.auto_set_column_width(list(range(frame.width)))
+    for (row, column), cell in table.get_celld().items():
+        cell.set_edgecolor("white")
+        cell.set_facecolor("#F0F4F8" if row % 2 else "white")
+        if row == 0:
+            cell.set_facecolor("#193B58")
+            cell.set_text_props(color="white", fontweight="bold")
+    figure.tight_layout()
+    finish_figure(figure, filename)
+
+
+# Capital is recalculated by the engine. Bucket VaRs are never added together.
+midpoint_hvar = midpoint_calculator._results
+summary_rows = []
+for method, calculator in calculators.items():
+    hvar = calculator._results
+    change_pct = 100 * (hvar / midpoint_hvar - 1) if midpoint_hvar else None
+    summary_rows.append({
+        "Method": labels[method], "HVaR (EUR m)": hvar / 1e6,
+        "Change (EUR m)": (hvar - midpoint_hvar) / 1e6,
+        "Change (%)": change_pct,
+    })
+summary = pl.DataFrame(summary_rows)
+show_table(summary, "CSRBB HVaR compared with midpoints", "01_capital_table.png", {
+    "HVaR (EUR m)": ",.3f", "Change (EUR m)": "+,.3f", "Change (%)": "+.2f",
+})
+
+# Check the factor actually stored in valuation, including actual-date variation.
+factor_rows = []
+for method, calculator in calculators.items():
+    bucket_col = calculator._mapped_bucket_col["present_values"]
+    side_col = calculator._banking_book_type_col["present_values"]
+    factor_col = calculator._value_col["time_factors"]
+    factors = (
+        calculator._present_values.filter(pl.col(bucket_col) == "bucket_01")
+        .group_by(side_col)
+        .agg(
+            pl.col(factor_col).min().alias("Min years"),
+            pl.col(factor_col).max().alias("Max years"),
+        )
+        .sort(side_col)
+    )
+    for row in factors.to_dicts():
+        factor_rows.append({
+            "Method": labels[method], "Side": row[side_col],
+            "Min years": row["Min years"], "Max years": row["Max years"],
+        })
+factor_check = pl.DataFrame(factor_rows)
+show_table(factor_check, "Applied time factors for bucket_01", "02_factors_table.png", {
+    "Min years": ".6f", "Max years": ".6f",
+})
+
+focus_table = focus.select(
+    pl.col("shock_date").alias("Shock date"),
+    *[(pl.col(f"{method}_loss") / 1e6).alias(labels[method]) for method in calculators],
+)
+show_table(focus_table, "Same historical scenarios — portfolio loss in EUR m",
+           "03_scenarios_table.png", {label: ",.3f" for label in labels.values()})
+
+
+# 5. Show absolute HVaR and its change from the midpoint result.
+figure, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+short_labels = ["Midpoints", "Combined\naverage", "Separate\naverages", "Actual\ndates"]
+bars = axes[0].bar(short_labels, summary["HVaR (EUR m)"].to_list(), color=colors)
+axes[0].bar_label(bars, fmt="%.3f", padding=4)
+axes[0].set_title("Portfolio HVaR")
+axes[0].set_ylabel("EUR million")
+bars = axes[1].bar(short_labels[1:], summary["Change (EUR m)"].to_list()[1:], color=colors[1:])
+axes[1].bar_label(bars, fmt="%+.3f", padding=4)
+axes[1].set_title("Change from midpoints")
+axes[1].set_ylabel("EUR million")
+for axis in axes:
+    axis.axhline(0, color="#65717E", linewidth=0.8)
+    axis.margins(y=0.2)
+    axis.set_axisbelow(True)
+    axis.grid(axis="y", alpha=0.2)
+figure.text(0.02, 0.01, "Actual payment dates retain the existing bucket-based rate and spread mappings.", fontsize=8)
+figure.tight_layout(rect=(0, 0.06, 1, 1))
+finish_figure(figure, "04_capital_comparison.png")
+
+
+# Compare the same shocks across all methods, before quantile selection.
+figure, axis = plt.subplots(figsize=(10, 4.8))
+x = np.arange(focus.height)
+for index, method in enumerate(calculators):
+    axis.bar(x + (index - 1.5) * 0.18, focus[f"{method}_loss"].to_numpy() / 1e6,
+             width=0.18, label=labels[method], color=colors[index])
+axis.set_xticks(x, [str(value) for value in focus["shock_date"].to_list()])
+axis.set_title("Portfolio losses for the same historical shocks")
+axis.set_ylabel("Scenario loss in EUR million")
+axis.set_axisbelow(True)
+axis.grid(axis="y", alpha=0.2)
+axis.legend(ncol=2, frameon=False)
+figure.tight_layout()
+finish_figure(figure, "05_scenario_comparison.png")
+
+
+# 6. Separate the two liability buckets examined earlier from the rest.
+time_buckets = midpoint_calculator.config["mappings"]["time_buckets"]
+groups = [
+    time_buckets["bucket_10"]["desc"] + "\nliabilities",
+    time_buckets["bucket_11"]["desc"] + "\nliabilities",
+    "Rest of portfolio",
+]
+liability = pl.col("side") == "liability"
+changes = (
+    by_bucket.with_columns(
+        pl.when(liability & (pl.col("bucket") == "bucket_10")).then(pl.lit(groups[0]))
+        .when(liability & (pl.col("bucket") == "bucket_11")).then(pl.lit(groups[1]))
+        .otherwise(pl.lit(groups[2])).alias("group"),
+        (pl.col("combined_loss") - pl.col("midpoint_loss")).alias("combined_change"),
+        (pl.col("split_loss") - pl.col("midpoint_loss")).alias("split_change"),
+        (pl.col("actual_loss") - pl.col("midpoint_loss")).alias("actual_change"),
+    )
+    .group_by(["shock_date", "group"])
+    .agg(pl.col("combined_change", "split_change", "actual_change").sum())
+)
+figure, axes = plt.subplots(1, len(focus_dates), figsize=(12, 5), sharey=True, squeeze=False)
+for axis, shock_date in zip(axes[0], sorted(focus_dates)):
+    scenario = changes.filter(pl.col("shock_date") == shock_date)
+    for index, method in enumerate(("combined", "split", "actual")):
+        amounts = {row["group"]: row[f"{method}_change"] for row in scenario.to_dicts()}
+        values = [amounts.get(group, 0) / 1e6 for group in groups]
+        axis.bar(np.arange(3) + (index - 1) * 0.24, values, width=0.24,
+                 label=labels[method], color=colors[index + 1])
+    axis.set_xticks(np.arange(3), groups)
+    axis.set_title(str(shock_date))
+    axis.axhline(0, color="#65717E", linewidth=0.8)
+    axis.set_axisbelow(True)
+    axis.grid(axis="y", alpha=0.2)
+axes[0, 0].set_ylabel("Change in scenario loss from midpoints, EUR m")
+handles, legend_labels = axes[0, 0].get_legend_handles_labels()
+figure.legend(handles, legend_labels, loc="lower center", ncol=3, frameon=False)
+figure.suptitle("Where the selected scenario loss changes arise", fontweight="bold")
+figure.tight_layout(rect=(0, 0.08, 1, 0.94))
+finish_figure(figure, "06_bucket_drivers.png")
+
+
+# Save the numeric tables alongside the presentation images.
+summary.write_csv(report_dir / "capital_summary.csv")
+factor_check.write_csv(report_dir / "time_factors_bucket01.csv")
+comparison.sort("shock_date").write_csv(report_dir / "scenario_comparison.csv")
+by_bucket.sort(keys).write_csv(report_dir / "bucket_contributions.csv")
+pl.DataFrame(reconciliation_rows).write_csv(report_dir / "reconciliation.csv")
+print(f"Four runs in total. Comparison tables and figures saved to {report_dir.resolve()}")
