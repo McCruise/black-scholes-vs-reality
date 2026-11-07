@@ -1,234 +1,125 @@
-# The normal run is already done.
-normal = csrbb_calculator
+# Rank scenario losses separately for each method.
+ranked = losses
 
-
-def run_model(time_factors=None, side_factors=None, actual_dates=False):
-    # Loading the configuration again gives each run its own settings.
-    calc = CsrbbEngine(
-        path_to_config=normal._config_path,
-        stress_mode=None,
+for name in runs:
+    ranks = (
+        losses.select("date", name)
+        .sort([name, "date"], descending=[True, False])
+        .with_row_index(f"{name}_rank", offset=1)
+        .select("date", f"{name}_rank")
     )
+    ranked = ranked.join(ranks, on="date", validate="1:1")
 
-    if time_factors is not None:
-        calc.time_factors.update(time_factors)
-
-    calc.time_factors_by_side = side_factors
-    calc.mt4_actual_dates = actual_dates
-    calc.run_all()
-
-    if calc._results is None or not np.isfinite(calc._results):
-        raise RuntimeError("The run failed. Check the engine log.")
-
-    return calc
+# Calculate changes from the midpoint scenario loss.
+change_cols = [
+    (pl.col(name) - pl.col("Midpoints")).alias(f"{name} change")
+    for name in methods
+]
+ranked = ranked.with_columns(change_cols)
 
 
-combined = run_model(time_factors=cashflows_all_dict)
-
-split = run_model(
-    side_factors={
-        "asset": cashflows_dict_assets,
-        "liability": cashflows_dict_liabs,
-    }
+# Original comparison of the ten worst midpoint or split scenarios.
+tail10 = (
+    ranked.filter(
+        (pl.col("Midpoints_rank") <= 10)
+        | (pl.col("Split_rank") <= 10)
+    )
+    .sort("Split_rank")
 )
 
-actual = run_model(actual_dates=True)
-
-runs = {
-    "Midpoints": normal,
-    "Combined": combined,
-    "Split": split,
-    "Actual dates": actual,
-}
-
-####################################################
-
-
-# Compare HVaR across the four methods.
-summary = pl.DataFrame([
-    {
-        "Method": name,
-        "HVaR (€m)": calc._results / 1e6,
-        "Change (€m)": (calc._results - normal._results) / 1e6,
-        "Change (%)": (
-            100 * (calc._results / normal._results - 1)
-            if normal._results else None
-        ),
-    }
-    for name, calc in runs.items()
-])
-
-display(
-    summary.with_columns(
-        pl.col("HVaR (€m)", "Change (€m)").round(3),
-        pl.col("Change (%)").round(2),
+# Five worst scenarios from any of the four methods.
+tail5 = (
+    ranked.filter(
+        pl.any_horizontal([
+            pl.col(f"{name}_rank") <= 5
+            for name in runs
+        ])
     )
-)
-
-# Show the change from the midpoint result.
-plt.figure(figsize=(7, 4))
-plt.bar(
-    summary["Method"].to_list()[1:],
-    summary["Change (€m)"].to_list()[1:],
-)
-plt.axhline(0, color="grey", linewidth=0.8)
-plt.ylabel("HVaR change versus midpoints (€m)")
-plt.title("Effect of maturity treatment")
-plt.tight_layout()
-plt.savefig("mt4_hvar_change.png", dpi=200)
-plt.show()
-
-
-# Compare losses for the same historical shocks.
-tables = []
-
-for name, calc in runs.items():
-    tables.append(
-        calc._daily_spreads.select(
-            pl.col(calc._date_col["spread_changes"]).alias("date"),
-            pl.col(calc._value_col["csrbb_daily_risk"]).alias(name),
-        )
-    )
-
-losses = tables[0]
-
-for table in tables[1:]:
-    losses = losses.join(table, on="date", validate="1:1")
-
-if losses.is_empty() or any(
-    losses.height != table.height for table in tables
-):
-    raise ValueError("The runs have different shock dates.")
-
-dates = (
-    pl.Series(["2019-12-02", "2019-12-05"])
-    .str.to_date()
-    .to_list()
-)
-
-focus = losses.filter(pl.col("date").is_in(dates)).sort("date")
-
-if focus.height != len(dates):
-    raise ValueError("A selected date is missing.")
-
-# Scenario losses in €m.
-display(
-    focus.with_columns(
-        (pl.col(list(runs)) / 1e6).round(3)
-    )
+    .sort("Actual dates_rank")
 )
 
 
+# Original investigation of the second and third worst split scenarios.
+driver_dates = (
+    ranked.filter(pl.col("Split_rank").is_in([2, 3]))
+    ["date"].to_list()
+)
 
-##################################################
-
-def bucket_losses(calc, name, dates):
-    date_col = calc._date_col["spread_changes"]
-    bucket_col = calc._mapped_bucket_col["present_values"]
-    side_col = calc._banking_book_type_col["present_values"]
-    pv = calc._value_col["present_values"]
-    shocked_pv = calc._value_col["shocked_present_value"]
-
-    return (
-        calc._spread_risk_details
-        .filter(pl.col(date_col).is_in(dates))
-        .group_by([date_col, bucket_col, side_col])
-        .agg((pl.col(pv) - pl.col(shocked_pv)).sum().alias(name))
-        .rename({
-            date_col: "date",
-            bucket_col: "bucket",
-            side_col: "side",
-        })
-    )
-
-
-by_bucket = bucket_losses(normal, "Midpoints", dates)
+tail_buckets = bucket_losses(normal, "Midpoints", driver_dates)
 
 for name, calc in list(runs.items())[1:]:
-    by_bucket = by_bucket.join(
-        bucket_losses(calc, name, dates),
+    tail_buckets = tail_buckets.join(
+        bucket_losses(calc, name, driver_dates),
         on=["date", "bucket", "side"],
         how="full",
         coalesce=True,
         validate="1:1",
     )
 
-if any(by_bucket[name].null_count() for name in runs):
+if any(tail_buckets[name].null_count() for name in runs):
     raise ValueError("A bucket or side is missing from one run.")
 
-# Check that the bucket losses add up to the portfolio loss.
-for shock_date in dates:
-    buckets = by_bucket.filter(pl.col("date") == shock_date)
-    portfolio = focus.filter(pl.col("date") == shock_date)
+detail = tail_buckets.with_columns(change_cols)
 
-    for name in runs:
-        if not np.isclose(
-            buckets[name].sum(),
-            portfolio[name].item(),
-            atol=0.01,
-            rtol=0,
-        ):
-            raise ValueError(f"Losses do not reconcile for {name}.")
-
-
-# Separate the two liability buckets examined earlier.
-time_buckets = normal.config["mappings"]["time_buckets"]
-groups = [
-    time_buckets["bucket_10"]["desc"] + "\nliabilities",
-    time_buckets["bucket_11"]["desc"] + "\nliabilities",
-    "Rest of portfolio",
-]
-methods = ["Combined", "Split", "Actual dates"]
-liability = pl.col("side") == "liability"
-
-drivers = (
-    by_bucket.with_columns(
-        pl.when(liability & (pl.col("bucket") == "bucket_10"))
-        .then(pl.lit(groups[0]))
-        .when(liability & (pl.col("bucket") == "bucket_11"))
-        .then(pl.lit(groups[1]))
-        .otherwise(pl.lit(groups[2]))
-        .alias("group"),
-
-        (pl.col("Combined") - pl.col("Midpoints")).alias("Combined"),
-        (pl.col("Split") - pl.col("Midpoints")).alias("Split"),
-        (pl.col("Actual dates") - pl.col("Midpoints")).alias("Actual dates"),
+# Five largest bucket changes for each date, ranked by absolute split change.
+top_drivers = (
+    detail
+    .sort(
+        ["date", pl.col("Split change").abs()],
+        descending=[False, True],
     )
-    .group_by(["date", "group"])
-    .agg(pl.col(methods).sum() / 1e6)
+    .group_by("date", maintain_order=True)
+    .head(5)
 )
 
-# Changes in scenario losses, in €m.
-display(drivers.sort(["date", "group"]))
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
-x = np.arange(3)
+# Reconcile all bucket changes with the portfolio scenario change.
+reconciliation = (
+    detail.group_by("date")
+    .agg(
+        pl.col("Split change").sum().alias("bucket_total"),
+        pl.col("Split change").null_count().alias("missing_groups"),
+    )
+    .join(
+        ranked.select("date", "Split change"),
+        on="date",
+        validate="1:1",
+    )
+    .with_columns(
+        (pl.col("bucket_total") - pl.col("Split change"))
+        .alias("difference")
+    )
+    .sort("date")
+)
 
-for ax, shock_date in zip(axes, dates):
-    data = drivers.filter(pl.col("date") == shock_date)
+if not np.all(
+    np.isclose(
+        reconciliation["difference"].to_numpy(),
+        0,
+        atol=0.01,
+        rtol=0,
+    )
+):
+    raise ValueError("Bucket changes do not reconcile.")
 
-    for i, name in enumerate(methods):
-        values = [
-            data.filter(pl.col("group") == group)[name].sum()
-            for group in groups
-        ]
-        ax.bar(
-            x + (i - 1) * 0.22,
-            values,
-            width=0.22,
-            label=name,
-        )
 
-    ax.set_xticks(x, groups)
-    ax.set_title(str(shock_date))
-    ax.axhline(0, color="grey", linewidth=0.8)
+# Show complete tables. Losses and changes are in EUR.
+with pl.Config(tbl_rows=-1, tbl_cols=-1):
+    print("Ten worst midpoint or split scenarios")
+    display(tail10)
 
-axes[0].set_ylabel("Change versus midpoints (€m)")
-axes[1].legend()
-plt.tight_layout()
-plt.savefig("mt4_drivers.png", dpi=200)
-plt.show()
+    print("Five worst scenarios across all four methods")
+    display(tail5)
 
-# Save the tables for sharing.
-summary.write_csv("mt4_summary.csv")
-losses.write_csv("mt4_scenario_losses.csv")
-drivers.write_csv("mt4_drivers.csv")
+    print("Five largest bucket changes for each investigated date")
+    display(top_drivers)
+
+    print("Bucket changes reconciled to the portfolio change")
+    display(reconciliation)
+
+
+# Save the detailed tables.
+tail10.write_csv("mt4_top10_scenarios.csv")
+tail5.write_csv("mt4_top5_scenarios.csv")
+top_drivers.write_csv("mt4_top5_bucket_drivers.csv")
+reconciliation.write_csv("mt4_tail_reconciliation.csv")
